@@ -118,6 +118,7 @@
 
 pub mod address;
 pub mod core;
+pub mod transport;
 
 // Re-export the main public API
-pub use core::{InboundPacket, PacketConn, PeerStats, PublicKeyBytes};
+pub use core::{BloomFilter, InboundPacket, PacketConn, PeerStats, PublicKeyBytes};

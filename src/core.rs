@@ -2,8 +2,6 @@
 //!
 //! Wire-compatible with yggdrasil-go / ironwood Go implementation.
 
-#![allow(unused_imports, unused_variables)]
-
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     io,
@@ -12,7 +10,6 @@ use std::{
 };
 
 use anyhow::{anyhow, Result};
-use blake2::Digest;
 use curve25519_dalek::edwards::CompressedEdwardsY;
 use crypto_box::{
     SalsaBox,
@@ -28,7 +25,7 @@ use tokio::{
     sync::{mpsc, Mutex},
     time,
 };
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 use x25519_dalek::{StaticSecret as X25519Secret, PublicKey as X25519Public};
 
 // ============================================================================
@@ -264,14 +261,14 @@ fn box_open(ct: &[u8], nonce_u64: u64, their_pub: &BoxPub, our_priv: &BoxPriv) -
 // ============================================================================
 
 #[derive(Clone)]
-struct BloomFilter {
+pub struct BloomFilter {
     bits: [u64; BLOOM_U], // 128 uint64 words = 8192 bits
 }
 
 impl BloomFilter {
-    fn new() -> Self { BloomFilter { bits: [0u64; BLOOM_U] } }
+    pub fn new() -> Self { BloomFilter { bits: [0u64; BLOOM_U] } }
 
-    fn base_hashes(data: &[u8]) -> [u64; 4] {
+    pub fn base_hashes(data: &[u8]) -> [u64; 4] {
         // Match Go's bits-and-blooms/bloom/v3 sum256():
         // hash1,hash2 = murmur128(data)
         // hash3,hash4 = murmur128(data + "\x01")
@@ -294,7 +291,7 @@ impl BloomFilter {
         (v % (BLOOM_M as u64)) as usize
     }
 
-    fn add(&mut self, data: &[u8]) {
+    pub fn add(&mut self, data: &[u8]) {
         let h = Self::base_hashes(data);
         for i in 0..BLOOM_K as u64 {
             let loc = Self::location(&h, i);
@@ -327,7 +324,7 @@ impl BloomFilter {
         BLOOM_F + BLOOM_F + kept * 8
     }
 
-    fn encode(&self, out: &mut Vec<u8>) {
+    pub fn encode(&self, out: &mut Vec<u8>) {
         let mut flags0 = [0u8; BLOOM_F];
         let mut flags1 = [0u8; BLOOM_F];
         let mut kept: Vec<u64> = Vec::new();
@@ -347,7 +344,7 @@ impl BloomFilter {
         }
     }
 
-    fn decode(data: &[u8]) -> Option<BloomFilter> {
+    pub fn decode(data: &[u8]) -> Option<BloomFilter> {
         if data.len() < BLOOM_F + BLOOM_F { return None; }
         let flags0 = &data[..BLOOM_F];
         let flags1 = &data[BLOOM_F..BLOOM_F*2];
@@ -2415,6 +2412,7 @@ struct NetworkCore {
 // PacketConn (public API)
 // ============================================================================
 
+#[derive(Clone)]
 pub struct PacketConn {
     inner: Arc<PacketConnInner>,
 }

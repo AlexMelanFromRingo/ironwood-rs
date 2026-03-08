@@ -25,7 +25,17 @@ bytes = "1"
 anyhow = "1"
 thiserror = "2"
 blake2 = "0.10"
+# TLS transport helper
+tokio-rustls = "0.26"
+rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "std"] }
+rustls-pki-types = "1"
+rcgen = { version = "0.13", features = ["pem"] }
 
 [dev-dependencies]
 tokio-test = "0.4"
 tracing-subscriber = "0.3"
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[[bench]]
+name = "bloom"
+harness = false
