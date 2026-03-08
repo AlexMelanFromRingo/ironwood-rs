@@ -84,102 +84,6 @@
 //! | 8     | PATH_BROKEN    | Unicast      | Source route path failure notification   |
 //! | 9     | TRAFFIC        | Unicast      | Encrypted session traffic                |
 //!
-//! ## Packet Formats
-//!
-//! ### ANNOUNCE (type 4)
-//!
-//! ```text
-//! ┌──────────┬──────────┬──────────┬───────────────┬──────────────┐
-//! │ root_key │ root_seq │  parent  │  peer entries │  signature   │
-//! │ (32 B)   │ (uvarint)│ (32 B)   │  (repeated)   │  (64 B)      │
-//! └──────────┴──────────┴──────────┴───────────────┴──────────────┘
-//! ```
-//!
-//! Each peer entry: `[pubkey (32B)] [port (uvarint)] [latency (uvarint)]`
-//!
-//! ### BLOOM_FILTER (type 5)
-//!
-//! ```text
-//! ┌─────────┬──────────┬──────────────────────────┐
-//! │ flags0  │ flags1   │  compressed bitset data   │
-//! │ (16 B)  │ (16 B)   │  (variable)               │
-//! └─────────┴──────────┴──────────────────────────┘
-//! ```
-//!
-//! Compression: flags0[bit i] = 1 means word i of the filter is all-zero (skip).
-//! flags1[bit i] = 1 means word i is all-ones (skip). The full filter is 1024 bytes
-//! (8192 bits = 128 u64 words). 8 hashes per element.
-//! Hash function: murmur3 x64 128-bit, called twice (on `data` and `data+[0x01]`).
-//! Location formula: `h[i%2] + i * h[2 + (((i + (i%2)) % 4) / 2)]`
-//!
-//! ### PATH_LOOKUP (type 6)
-//!
-//! ```text
-//! ┌─────────────────┬─────────────────┬──────────┬──────────┐
-//! │  dest_key (32B) │ source_key (32B)│ dest_x   │ source_x │
-//! │                 │                 │ (uvarint) │ (uvarint)│
-//! └─────────────────┴─────────────────┴──────────┴──────────┘
-//! ```
-//!
-//! dest_x and source_x are XOR-hashed tree coordinates for greedy routing.
-//!
-//! ### TRAFFIC (type 9)
-//!
-//! ```text
-//! ┌──────────────────────────┬──────────┬──────────┬───────────┬───────────┬─────────┐
-//! │  path (zero-term uvarints)│ from(path)│source(32B)│ dest(32B) │watermark  │ payload │
-//! └──────────────────────────┴──────────┴──────────┴───────────┴───────────┴─────────┘
-//! ```
-//!
-//! Path is a sequence of uvarint peer port numbers, terminated by a zero.
-//!
-//! ### Session Init/Ack (inside TRAFFIC payload)
-//!
-//! ```text
-//! ┌──────┬─────────────────┬───────────┬─────────────┬───────────────┬──────────┬─────────┐
-//! │ type │ box_pub (32 B)  │ encrypted │  ed_sig     │ current (32B) │ next(32B)│ key_seq │
-//! │ (1B) │                 │ body      │  (64 B)     │               │          │ (8B LE) │
-//! └──────┴─────────────────┴───────────┴─────────────┴───────────────┴──────────┴─────────┘
-//! ```
-//!
-//! Total: 193 bytes. The encrypted body contains: `[current_pub (32B)] [next_pub (32B)] [seq (8B)] [key_seq (8B)]`
-//!
-//! ## Session Encryption Protocol
-//!
-//! Sessions use a double-ratchet with three key slots per direction:
-//!
-//! ```text
-//! Each node maintains:
-//!   recv_pub/priv  — previous send key, now used for receiving
-//!   send_pub/priv  — current send key
-//!   next_pub/priv  — next send key (pre-generated)
-//!
-//! On receiving Init/Ack (_handleUpdate in Go):
-//!   recv ← send          (old send becomes recv)
-//!   send ← next          (pre-generated next becomes current)
-//!   next ← new_random()  (generate fresh next key)
-//!   local_key_seq += 1
-//!   remote_key_seq = init.key_seq
-//! ```
-//!
-//! Key selection for decryption (4 cases from Go source):
-//! ```text
-//! fromCurrent && toRecv  → DH(remote.current, local.recv_priv)
-//! fromNext    && toSend  → DH(remote.next,    local.send_priv)   [key rotation]
-//! fromNext    && toRecv  → DH(remote.next,    local.recv_priv)   [simultaneous init]
-//! else                   → sendInit() and drop packet
-//! ```
-//!
-//! ## Spanning Tree Algorithm
-//!
-//! The spanning tree self-organizes using these rules:
-//!
-//! 1. The node with the numerically lowest public key becomes root
-//! 2. Each non-root node selects a parent that minimizes `cost(root_distance × latency)`
-//! 3. Announcements are propagated to all peers with ed25519 signatures
-//! 4. Signature chains allow any node to verify the full path to root
-//! 5. Tree info expires after 2 minutes without refresh
-//!
 //! ## Usage
 //!
 //! ```rust,no_run
@@ -212,14 +116,8 @@
 //! }
 //! ```
 
-#![allow(dead_code)]
-
-pub mod packet;
-pub mod spanning_tree;
-pub mod bloom;
-pub mod pathfinder;
-pub mod session;
-pub mod router;
+pub mod address;
+pub mod core;
 
 // Re-export the main public API
-pub use router::PacketConn;
+pub use core::{InboundPacket, PacketConn, PeerStats, PublicKeyBytes};
