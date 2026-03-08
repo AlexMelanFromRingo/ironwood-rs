@@ -30,6 +30,8 @@ tokio-rustls = "0.26"
 rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "std"] }
 rustls-pki-types = "1"
 rcgen = { version = "0.13", features = ["pem"] }
+# QUIC transport (quinn uses rustls for TLS)
+quinn = { version = "0.11", default-features = false, features = ["rustls", "ring"] }
 
 [dev-dependencies]
 tokio-test = "0.4"

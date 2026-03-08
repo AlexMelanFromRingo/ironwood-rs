@@ -418,7 +418,6 @@ LGPL-3.0 — same as yggdrasil-go.
 ## Contributing
 
 Contributions welcome. Key areas for improvement:
-- Add integration tests against a live yggdrasil-go node
-- Add TLS peer support
-- Add QUIC peer support
-- Benchmark bloom filter encode/decode
+- Improve two-node integration test throughput and latency measurement
+- Add WebSocket transport helper (`ws://` / `wss://`)
+- UNIX socket transport helper (Linux/macOS)

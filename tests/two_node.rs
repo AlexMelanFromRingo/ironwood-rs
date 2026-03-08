@@ -22,9 +22,16 @@ use tokio::net::{TcpListener, TcpStream};
 // Helpers
 // ---------------------------------------------------------------------------
 
+fn make_signing_key() -> SigningKey {
+    SigningKey::generate(&mut OsRng)
+}
+
+fn make_node_with_key(key: &SigningKey) -> PacketConn {
+    PacketConn::new(key.clone())
+}
+
 fn make_node() -> PacketConn {
-    let key = SigningKey::generate(&mut OsRng);
-    PacketConn::new(key)
+    PacketConn::new(make_signing_key())
 }
 
 /// Connect two nodes over a loopback TCP socket.
@@ -133,13 +140,14 @@ async fn test_distinct_public_keys() {
 
 /// Connect to a live yggdrasil-go node if `YGG_TEST_PEER` is set.
 ///
-/// Uses yggdrasil-go's TCP peer protocol — requires the full yggdrasil
-/// version metadata handshake (not the simple ironwood key exchange).
-/// Run:
+/// Uses the yggdrasil-go wire-compatible version-metadata handshake
+/// (`handle_yggdrasil_stream`). Run:
 /// ```text
-/// YGG_TEST_PEER=tcp://ygg.mkg20001.io:80 cargo test live_peer -- --nocapture
+/// YGG_TEST_PEER=tcp://ygg.mkg20001.io:80 cargo test live_peer -- --nocapture --ignored
+/// YGG_TEST_PEER=tls://ygg.mkg20001.io:443 cargo test live_peer -- --nocapture --ignored
 /// ```
 #[tokio::test]
+#[ignore = "requires YGG_TEST_PEER env var and network access"]
 async fn live_peer() {
     let peer_uri = match std::env::var("YGG_TEST_PEER") {
         Ok(p) => p,
@@ -149,25 +157,38 @@ async fn live_peer() {
         }
     };
 
-    let node = make_node();
+    let signing_key = make_signing_key();
+    let node = make_node_with_key(&signing_key);
     eprintln!("Our key: {}", hex::encode(node.public_key()));
 
-    let addr = peer_uri.strip_prefix("tcp://").unwrap_or(&peer_uri);
-    let stream = TcpStream::connect(addr).await
-        .expect("TCP connect to live peer");
-
     let node_clone = node.clone();
-    tokio::spawn(async move {
-        // NOTE: yggdrasil-go expects the yggdrasil version metadata handshake
-        // before the Ironwood key exchange.  For a full live test, use
-        // yggdrasil-rs which implements the complete handshake in core/link.rs.
-        transport::handle_stream(&node_clone, stream, 0).await.unwrap_or(());
-    });
+    let sk_clone = signing_key.clone();
 
-    tokio::time::sleep(Duration::from_secs(4)).await;
+    // Dial and handshake — TCP or TLS depending on URI scheme
+    if peer_uri.starts_with("tls://") {
+        let tls = transport::dial_tls(&peer_uri).await
+            .expect("TLS connect to live peer");
+        tokio::spawn(async move {
+            transport::handle_yggdrasil_stream(&node_clone, tls, &sk_clone, b"", 0)
+                .await.unwrap_or(());
+        });
+    } else {
+        let addr = peer_uri.strip_prefix("tcp://").unwrap_or(&peer_uri);
+        let tcp = TcpStream::connect(addr).await
+            .expect("TCP connect to live peer");
+        tokio::spawn(async move {
+            transport::handle_yggdrasil_stream(&node_clone, tcp, &sk_clone, b"", 0)
+                .await.unwrap_or(());
+        });
+    };
+
+    // Wait for spanning tree to stabilise
+    tokio::time::sleep(Duration::from_secs(5)).await;
 
     let stats = node.get_peer_stats();
-    eprintln!("Peer count after connect: {}", stats.len());
+    assert!(!stats.is_empty(),
+        "No peers after 5s — handshake may have failed. Check that {peer_uri} is reachable.");
+    eprintln!("Connected to {peer_uri}. Peers: {}", stats.len());
     for p in &stats {
         eprintln!("  peer: {} rx={} tx={} latency={:?}",
             hex::encode(&p.key[..8]), p.rx_bytes, p.tx_bytes, p.latency);
