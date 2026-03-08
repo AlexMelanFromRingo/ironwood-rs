@@ -418,7 +418,6 @@ LGPL-3.0 — same as yggdrasil-go.
 ## Contributing
 
 Contributions welcome. Key areas for improvement:
-- Complete the `unimplemented!()` stubs in router.rs, spanning_tree.rs, pathfinder.rs
 - Add integration tests against a live yggdrasil-go node
 - Add TLS peer support
 - Add QUIC peer support
