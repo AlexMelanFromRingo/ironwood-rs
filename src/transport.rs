@@ -53,6 +53,7 @@
 use anyhow::{anyhow, Result};
 use blake2::Blake2b512;
 use ed25519_dalek::{Signature, SigningKey, Signer, Verifier, VerifyingKey};
+use futures_util::{SinkExt, StreamExt};
 use quinn::crypto::rustls::QuicClientConfig;
 use rustls::ClientConfig;
 use rustls_pki_types::ServerName;
@@ -62,8 +63,17 @@ use tokio::{
     net::{TcpListener, TcpStream},
 };
 use tokio_rustls::{TlsAcceptor, TlsConnector};
+use tokio_tungstenite::{
+    accept_hdr_async_with_config,
+    client_async_with_config,
+    tungstenite::{
+        handshake::server::{Request as WsRequest, Response as WsResponse, ErrorResponse},
+        protocol::Message,
+    },
+    WebSocketStream,
+};
 
-use crate::{PacketConn, PublicKeyBytes};
+use crate::{BoxReader, BoxWriter, PacketConn};
 
 // ---------------------------------------------------------------------------
 // High-level: connect a raw stream to a PacketConn
@@ -530,4 +540,226 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
             .signature_verification_algorithms
             .supported_schemes()
     }
+}
+
+// ---------------------------------------------------------------------------
+// UNIX socket transport (Unix-like platforms only)
+// ---------------------------------------------------------------------------
+
+/// Listen on a UNIX domain socket at `path`.
+///
+/// The socket file is removed before binding if it already exists.
+/// Returns a `tokio::net::UnixListener`; call `.accept()` to get a
+/// `UnixStream` which implements `AsyncRead + AsyncWrite` and can be
+/// passed directly to [`handle_stream`] or [`handle_yggdrasil_stream`].
+#[cfg(unix)]
+pub async fn listen_unix(path: &str) -> Result<tokio::net::UnixListener> {
+    let _ = std::fs::remove_file(path);
+    tokio::net::UnixListener::bind(path)
+        .map_err(|e| anyhow!("UNIX bind {path}: {e}"))
+}
+
+/// Dial a UNIX domain socket at `path`.
+///
+/// `path` may have a `unix://` prefix which is stripped automatically.
+/// Returns a `UnixStream` that can be passed to [`handle_stream`] or
+/// [`handle_yggdrasil_stream`].
+#[cfg(unix)]
+pub async fn dial_unix(path: &str) -> Result<tokio::net::UnixStream> {
+    let path = path.strip_prefix("unix://").unwrap_or(path);
+    tokio::net::UnixStream::connect(path).await
+        .map_err(|e| anyhow!("UNIX connect {path}: {e}"))
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket transport (ws:// and wss://)
+// ---------------------------------------------------------------------------
+
+/// A WebSocket listener — accepts inbound `ws://` connections.
+///
+/// Returned by [`listen_ws`]. Each accepted connection is returned as a
+/// `(BoxReader, BoxWriter)` pair that can be passed to [`handle_stream`]
+/// or [`handle_yggdrasil_stream`].
+pub struct WsListener {
+    inner: TcpListener,
+}
+
+impl WsListener {
+    /// Accept the next inbound WebSocket connection.
+    ///
+    /// Performs the HTTP upgrade handshake and returns the byte-stream
+    /// halves of the WebSocket connection.
+    pub async fn accept(&self) -> Result<(BoxReader, BoxWriter)> {
+        let (tcp, _addr) = self.inner.accept().await
+            .map_err(|e| anyhow!("WS accept TCP: {e}"))?;
+
+        let ws = accept_hdr_async_with_config(
+            tcp,
+            |req: &WsRequest, mut resp: WsResponse| -> std::result::Result<WsResponse, ErrorResponse> {
+                // Negotiate ygg-ws subprotocol if offered by the client
+                let client_protos = req
+                    .headers()
+                    .get("Sec-WebSocket-Protocol")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                if client_protos.split(',').any(|p| p.trim() == "ygg-ws") {
+                    resp.headers_mut().insert(
+                        "Sec-WebSocket-Protocol",
+                        "ygg-ws".parse().unwrap(),
+                    );
+                }
+                Ok(resp)
+            },
+            None,
+        )
+        .await
+        .map_err(|e| anyhow!("WS handshake: {e}"))?;
+
+        Ok(bridge_ws(ws))
+    }
+}
+
+/// Create a WebSocket listener on `addr`.
+///
+/// `addr` is a plain `host:port` or `ws://host:port` (prefix stripped).
+/// For TLS-wrapped WebSocket (`wss://`), put a TLS terminator in front
+/// (e.g. nginx) and connect with plain `ws://` behind it — this matches
+/// yggdrasil-go behaviour.
+pub async fn listen_ws(addr: &str) -> Result<WsListener> {
+    let addr = addr.strip_prefix("ws://").unwrap_or(addr);
+    let inner = TcpListener::bind(addr).await
+        .map_err(|e| anyhow!("WS bind {addr}: {e}"))?;
+    Ok(WsListener { inner })
+}
+
+/// Dial a WebSocket peer (`ws://host:port[/path]`).
+///
+/// Uses the `ygg-ws` subprotocol, matching yggdrasil-go behaviour.
+/// Returns `(BoxReader, BoxWriter)` that can be passed to [`handle_stream`]
+/// or [`handle_yggdrasil_stream`].
+pub async fn dial_ws(url: &str) -> Result<(BoxReader, BoxWriter)> {
+    let url = if url.starts_with("ws://") { url.to_string() } else { format!("ws://{url}") };
+
+    // Build WS handshake request with subprotocol header
+    let request = tokio_tungstenite::tungstenite::http::Request::builder()
+        .uri(url.as_str())
+        .header("Sec-WebSocket-Protocol", "ygg-ws")
+        .body(())
+        .map_err(|e| anyhow!("WS request build: {e}"))?;
+
+    // Extract host:port for TCP connection
+    let host_port = {
+        let u = url.strip_prefix("ws://").unwrap_or(&url);
+        u.split('/').next().unwrap_or(u).to_string()
+    };
+
+    let tcp = TcpStream::connect(&host_port).await
+        .map_err(|e| anyhow!("WS TCP connect {host_port}: {e}"))?;
+
+    let (ws, _resp) = client_async_with_config(request, tcp, None).await
+        .map_err(|e| anyhow!("WS handshake: {e}"))?;
+
+    Ok(bridge_ws(ws))
+}
+
+/// Dial a WebSocket Secure peer (`wss://host:port[/path]`).
+///
+/// Connects via TLS (certificate verification skipped — Ironwood ed25519
+/// handshake provides authentication) and upgrades to WebSocket.
+/// Returns `(BoxReader, BoxWriter)`.
+pub async fn dial_wss(url: &str) -> Result<(BoxReader, BoxWriter)> {
+    // Strip wss:// to get host:port[/path]
+    let rest = url.strip_prefix("wss://").unwrap_or(url);
+    let host_port = rest.split('/').next().unwrap_or(rest);
+
+    // Connect via TLS (skip-verify, same as rest of yggdrasil)
+    let tls = dial_tls(host_port).await
+        .map_err(|e| anyhow!("WSS TLS connect {host_port}: {e}"))?;
+
+    // Build WS handshake request (note: URL for the request uses ws:// but
+    // the underlying stream is already TLS — this is standard for wss://)
+    let ws_url = format!("wss://{rest}");
+    let request = tokio_tungstenite::tungstenite::http::Request::builder()
+        .uri(ws_url.as_str())
+        .header("Sec-WebSocket-Protocol", "ygg-ws")
+        .body(())
+        .map_err(|e| anyhow!("WSS request build: {e}"))?;
+
+    let (ws, _resp) = client_async_with_config(request, tls, None).await
+        .map_err(|e| anyhow!("WSS handshake: {e}"))?;
+
+    Ok(bridge_ws(ws))
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket ↔ byte-stream bridge
+// ---------------------------------------------------------------------------
+
+/// Bridge a `WebSocketStream<S>` to `(BoxReader, BoxWriter)`.
+///
+/// Spawns a background task that shuttles data between the WebSocket
+/// message layer and an in-process byte pipe:
+/// - Outgoing bytes are sent as Binary WebSocket messages.
+/// - Incoming Binary (or Text) WebSocket messages are delivered as bytes.
+///
+/// This matches the behaviour of `websocket.NetConn()` in yggdrasil-go.
+fn bridge_ws<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    ws: WebSocketStream<S>,
+) -> (BoxReader, BoxWriter) {
+    // In-process duplex pipe: app_side ↔ bridge_side
+    let (app_side, bridge_side) = tokio::io::duplex(1 << 16);
+    let (app_r, app_w) = tokio::io::split(app_side);
+    let (mut bridge_r, mut bridge_w) = tokio::io::split(bridge_side);
+
+    tokio::spawn(async move {
+        let (mut ws_tx, mut ws_rx) = ws.split();
+
+        // WS → pipe: incoming WebSocket binary messages → raw bytes
+        let ws_to_bridge = async {
+            loop {
+                match ws_rx.next().await {
+                    Some(Ok(Message::Binary(data))) => {
+                        if bridge_w.write_all(&data).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Text(t))) => {
+                        if bridge_w.write_all(t.as_bytes()).await.is_err() {
+                            break;
+                        }
+                    }
+                    // Ping/Pong handled automatically by tungstenite
+                    Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) | Some(Ok(Message::Frame(_))) => {}
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                }
+            }
+        };
+
+        // pipe → WS: raw bytes from app side → Binary WebSocket messages
+        let bridge_to_ws = async {
+            let mut buf = vec![0u8; 65536];
+            loop {
+                match bridge_r.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if ws_tx
+                            .send(Message::Binary(buf[..n].to_vec().into()))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+        };
+
+        // Run until either direction closes
+        tokio::select! {
+            _ = ws_to_bridge => {}
+            _ = bridge_to_ws => {}
+        }
+    });
+
+    (Box::new(app_r), Box::new(app_w))
 }
