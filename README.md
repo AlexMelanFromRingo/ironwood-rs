@@ -11,7 +11,7 @@ This is the first Rust implementation of the Ironwood protocol. The implementati
 verified for wire compatibility against the Go reference implementation by successful
 end-to-end encrypted traffic exchange between Rust and Go nodes.
 
-`cargo check` passes with zero errors.
+Zero compiler warnings. All tests pass.
 
 ## What Is Ironwood?
 
@@ -329,71 +329,95 @@ When comparing same-root candidates:
 
 ```toml
 [dependencies]
-ironwood-rs = "0.1"
+ironwood-rs = { git = "https://github.com/AlexMelanFromRingo/ironwood-rs" }
 tokio = { version = "1", features = ["full"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
 ```
 
 ```rust,no_run
-use ironwood_rs::PacketConn;
+use ironwood_rs::{PacketConn, BoxReader, BoxWriter};
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
+use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Generate or load an ed25519 identity key
     let signing_key = SigningKey::generate(&mut OsRng);
-    println!("Node key: {}", hex::encode(signing_key.verifying_key().to_bytes()));
+    let conn = Arc::new(PacketConn::new(signing_key));
 
-    // Create the protocol endpoint
-    let conn = PacketConn::new(signing_key).await?;
-
-    // Listen for incoming peer connections
+    // Accept incoming peer connections
     let listener = tokio::net::TcpListener::bind("0.0.0.0:9001").await?;
     println!("Listening on :9001");
 
-    let conn_clone = conn.clone();
+    let conn2 = Arc::clone(&conn);
     tokio::spawn(async move {
         loop {
             if let Ok((stream, addr)) = listener.accept().await {
-                println!("Peer connected from {}", addr);
-                let c = conn_clone.clone();
+                println!("Peer connected from {addr}");
+                let (r, w) = tokio::io::split(stream);
+                // peer_pub_key must be obtained out-of-band or via a handshake layer
+                // (yggdrasil-rs provides the VersionMetadata handshake for this)
+                let peer_key: [u8; 32] = todo!("obtain peer public key");
+                let c = Arc::clone(&conn2);
                 tokio::spawn(async move {
-                    if let Err(e) = c.handle_conn(stream).await {
-                        eprintln!("Peer error: {}", e);
-                    }
+                    let _ = c.handle_conn(peer_key, Box::new(r), Box::new(w), 0).await;
                 });
             }
         }
     });
 
-    // Connect to a known peer
-    let peer_stream = tokio::net::TcpStream::connect("peer.example.com:9001").await?;
-    let c = conn.clone();
-    tokio::spawn(async move { c.handle_conn(peer_stream).await });
-
     // Main loop: receive and echo packets
-    let mut buf = vec![0u8; 65535];
     loop {
-        let (n, from) = conn.read_from(&mut buf).await?;
-        println!("Received {} bytes from {}", n, hex::encode(&from[..8]));
-        // Echo back
-        conn.write_to(&buf[..n], &from).await?;
+        let pkt = conn.read_from().await?;
+        println!("Received {} bytes from {}", pkt.payload.len(), hex::encode(&pkt.from[..8]));
+        conn.write_to(&pkt.payload, &pkt.from).await?;
     }
 }
 ```
 
+> **Note**: `PacketConn` itself only implements the Ironwood routing/encryption protocol.
+> The peer handshake (exchanging public keys before calling `handle_conn`) is the
+> responsibility of the caller. See [yggdrasil-rs](https://github.com/AlexMelanFromRingo/yggdrasil-rs)
+> for a full implementation including the Yggdrasil version metadata handshake,
+> TCP/TLS/QUIC/WebSocket/UNIX transport, TUN adapter, admin socket, and multicast discovery.
+
 ## Crate Structure
 
-| Module           | Description                                              |
-|------------------|----------------------------------------------------------|
-| `packet`         | Wire encoding: 10 packet types, uvarint framing, structs |
-| `spanning_tree`  | Spanning tree: parent selection, announces, expiry       |
-| `bloom`          | Bloom filter: 1024-byte, 8 murmur3 hashes, compression  |
-| `pathfinder`     | Source routing: PATH_LOOKUP/NOTIFY/BROKEN protocol       |
-| `session`        | Session encryption: NaCl box, double-ratchet, key deriv. |
-| `router`         | `PacketConn`: main public API                            |
+| File              | Description                                              |
+|-------------------|----------------------------------------------------------|
+| `src/core.rs`     | All protocol logic: spanning tree, bloom filter, pathfinder, session encryption, `PacketConn` public API |
+| `src/address.rs`  | IPv6 address/subnet derivation from ed25519 public keys  |
+| `src/transport.rs`| Wire encoding helpers (uvarint framing, used internally) |
+| `src/lib.rs`      | Public re-exports: `PacketConn`, `InboundPacket`, `PeerStats`, `BloomFilter`, `BoxReader`, `BoxWriter`, `PublicKeyBytes` |
+
+## Public API
+
+```rust
+// Create a node
+let conn = Arc::new(PacketConn::new(signing_key));
+
+// Connect a peer (after exchanging public keys via handshake)
+conn.handle_conn(peer_pub_key, reader, writer, priority).await?;
+
+// Send a packet
+conn.write_to(&payload, &dest_pub_key).await?;
+
+// Receive a packet
+let pkt: InboundPacket = conn.read_from().await?;
+// pkt.payload — decrypted payload bytes
+// pkt.from    — sender's ed25519 public key ([u8; 32])
+
+// Get peer statistics
+let stats: Vec<PeerStats> = conn.get_peer_stats();
+
+// Register a path-notify callback (called when a new path is discovered)
+conn.set_path_notify(|key: [u8; 32]| { /* ... */ }).await;
+
+// Shut down
+conn.close().await;
+```
 
 ## Features
 
@@ -408,16 +432,9 @@ async fn main() -> anyhow::Result<()> {
 - Go reference: `github.com/Arceliar/ironwood` (any version compatible with yggdrasil-go 0.5.x)
 - Yggdrasil: `yggdrasil-go v0.5.13`
 - Rust edition: 2024
-- Minimum Rust: 1.75 (for async fn in traits)
+- Minimum Rust: 1.85
 - Tokio: 1.x
 
 ## License
 
 LGPL-3.0 — same as yggdrasil-go.
-
-## Contributing
-
-Contributions welcome. Key areas for improvement:
-- Improve two-node integration test throughput and latency measurement
-- Add WebSocket transport helper (`ws://` / `wss://`)
-- UNIX socket transport helper (Linux/macOS)
