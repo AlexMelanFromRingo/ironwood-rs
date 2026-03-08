@@ -1,0 +1,30 @@
+[package]
+name = "ironwood-rs"
+version = "0.1.0"
+edition = "2024"
+authors = ["Yggdrasil Network Contributors"]
+description = "Rust implementation of the Ironwood routing protocol — the core of the Yggdrasil mesh network"
+license = "LGPL-3.0"
+repository = "https://github.com/AlexMelanFromRingo/ironwood-rs"
+keywords = ["yggdrasil", "mesh", "networking", "routing", "p2p"]
+categories = ["network-programming", "cryptography"]
+readme = "README.md"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+ed25519-dalek = { version = "2", features = ["hazmat", "rand_core"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+curve25519-dalek = "4"
+crypto_box = { version = "0.9", features = ["salsa20"] }
+murmur3 = "0.5"
+sha2 = "0.10"
+rand = "0.8"
+hex = "0.4"
+tracing = "0.1"
+bytes = "1"
+anyhow = "1"
+thiserror = "2"
+
+[dev-dependencies]
+tokio-test = "0.4"
+tracing-subscriber = "0.3"
