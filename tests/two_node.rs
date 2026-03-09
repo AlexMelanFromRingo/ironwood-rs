@@ -205,7 +205,9 @@ async fn live_peer() {
                 .await.unwrap_or(());
         });
     } else {
-        let addr = peer_uri.strip_prefix("tcp://").unwrap_or(&peer_uri);
+        // Strip scheme and query string: "tcp://host:port?key=..." → "host:port"
+        let without_scheme = peer_uri.strip_prefix("tcp://").unwrap_or(&peer_uri);
+        let addr = without_scheme.split('?').next().unwrap_or(without_scheme);
         let tcp = TcpStream::connect(addr).await
             .expect("TCP connect to live peer");
         tokio::spawn(async move {
