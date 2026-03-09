@@ -15,15 +15,16 @@
 //! use ironwood_rs::{PacketConn, transport};
 //! use ed25519_dalek::SigningKey;
 //! use rand::rngs::OsRng;
+//! use std::sync::Arc;
 //!
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {
 //!     let key = SigningKey::generate(&mut OsRng);
-//!     let conn = PacketConn::new(key).await?;
+//!     let conn = Arc::new(PacketConn::new(key));
 //!
 //!     // Dial a TLS peer (certificate not verified — auth happens at Ironwood layer)
 //!     let stream = transport::dial_tls("tls://peer.example.com:443").await?;
-//!     tokio::spawn(async move { conn.handle_conn(stream).await });
+//!     tokio::spawn(async move { transport::handle_stream(&conn, stream, 0).await });
 //!
 //!     Ok(())
 //! }
@@ -35,17 +36,18 @@
 //! use ironwood_rs::{PacketConn, transport};
 //! use ed25519_dalek::SigningKey;
 //! use rand::rngs::OsRng;
+//! use std::sync::Arc;
 //!
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {
 //!     let key = SigningKey::generate(&mut OsRng);
-//!     let conn = PacketConn::new(key).await?;
+//!     let conn = Arc::new(PacketConn::new(key));
 //!
 //!     let listener = transport::listen_tls("0.0.0.0:9001").await?;
 //!     loop {
 //!         let (stream, _addr) = listener.accept().await?;
-//!         let c = conn.clone();
-//!         tokio::spawn(async move { c.handle_conn(stream).await });
+//!         let c = Arc::clone(&conn);
+//!         tokio::spawn(async move { transport::handle_stream(&c, stream, 0).await });
 //!     }
 //! }
 //! ```

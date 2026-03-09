@@ -48,6 +48,11 @@ pub struct PeerStats {
     pub tx_bytes: u64,
     pub uptime: Duration,
     pub latency: Duration,
+    /// EWMA of |RTT delta| — measure of latency variance.
+    pub jitter: Duration,
+    /// Estimated packet loss rate in [0.0, 1.0], updated every maintenance tick.
+    /// Based on whether keepalive frames arrive on schedule (every 1s).
+    pub loss_rate: f32,
 }
 
 // ============================================================================
@@ -798,6 +803,9 @@ struct PeerData {
     write_tx:        mpsc::Sender<Vec<u8>>,
     req_send_time:   Option<Instant>,
     lag:             Duration,
+    jitter:          Duration,
+    last_rx_time:    Instant,
+    loss_rate:       f32,
     rx_bytes:        u64,
     tx_bytes:        u64,
     connected_at:    Instant,
@@ -967,6 +975,9 @@ impl RouterState {
             id, key, port, prio, order, write_tx,
             req_send_time: None,
             lag: Duration::from_nanos(u32::MAX as u64), // unknown latency
+            jitter: Duration::ZERO,
+            last_rx_time: Instant::now(),
+            loss_rate: 0.0,
             rx_bytes: 0, tx_bytes: 0,
             connected_at: Instant::now(),
             queue: PacketQueue::new(),
@@ -1043,9 +1054,34 @@ impl RouterState {
         self.expire_paths();
         self.reset_cache();
         self.update_ancestries();
+        self.update_loss_rates();
         self.fix();
         self.send_announces();
         self.bloom_do_maintenance();
+    }
+
+    /// Estimate per-peer packet loss rate via keepalive liveness.
+    ///
+    /// Keepalives are sent every 1s (`PEER_KEEPALIVE_DELAY`). If we have not
+    /// received *any* frame from a peer in the last 2 seconds, we infer at
+    /// least one keepalive was dropped and increase the loss estimate.
+    /// When frames are arriving on schedule, the estimate decays toward 0.
+    ///
+    /// Uses a 7/8 + 1/8 EWMA (≈ 8-sample window, matches the lag filter).
+    /// The resulting `loss_rate ∈ [0.0, 1.0]` is used in `get_cost()` to
+    /// penalise lossy links in spanning-tree parent selection.
+    fn update_loss_rates(&mut self) {
+        for peers in self.peers.values_mut() {
+            for p in peers.values_mut() {
+                let since_rx = p.last_rx_time.elapsed();
+                // PEER_KEEPALIVE_DELAY = 1s; if >2s silence → missed keepalive.
+                if since_rx > Duration::from_secs(2) {
+                    p.loss_rate = (p.loss_rate * 0.875 + 0.125).min(1.0);
+                } else {
+                    p.loss_rate = (p.loss_rate * 0.875).max(0.0);
+                }
+            }
+        }
     }
 
     fn expire_infos(&mut self) {
@@ -1105,7 +1141,16 @@ impl RouterState {
         for peers in self.peers.values() {
             if let Some(p) = peers.get(&id) {
                 let ms = p.lag.as_millis() as u64;
-                return if ms == 0 { 1 } else { ms };
+                let base = if ms == 0 { 1 } else { ms };
+                // Loss penalty: a link with 100% loss becomes 10× as expensive.
+                // This causes the spanning-tree parent selection and greedy
+                // routing to prefer low-loss paths over marginally faster ones.
+                //   loss_rate=0.0  → multiplier 1.0   (no change)
+                //   loss_rate=0.1  → multiplier 1.9
+                //   loss_rate=0.5  → multiplier 5.5
+                //   loss_rate=1.0  → multiplier 10.0
+                let penalty = 1.0_f64 + p.loss_rate as f64 * 9.0;
+                return ((base as f64 * penalty) as u64).max(1);
             }
         }
         1
@@ -1278,10 +1323,19 @@ impl RouterState {
                         .and_then(|ps| ps.get_mut(&peer_id))
                     {
                         if p.lag == Duration::from_nanos(u32::MAX as u64) {
+                            // First measurement: initialise lag, jitter stays zero.
                             p.lag = rtt * 2;
                         } else {
                             let prev = p.lag;
-                            p.lag = p.lag * 7 / 8 + rtt.min(prev * 2) / 8;
+                            let rtt_clamped = rtt.min(prev * 2);
+                            // RTT jitter: EWMA of absolute deviation (RFC 3550 §A.8 style).
+                            let delta = if rtt_clamped > prev {
+                                rtt_clamped - prev
+                            } else {
+                                prev - rtt_clamped
+                            };
+                            p.jitter = p.jitter * 7 / 8 + delta / 8;
+                            p.lag = prev * 7 / 8 + rtt_clamped / 8;
                         }
                         p.lag
                     } else { Duration::ZERO };
@@ -2498,10 +2552,12 @@ impl PacketConn {
     pub fn public_key(&self) -> PublicKeyBytes { self.inner.pub_key }
 
     pub fn mtu(&self) -> u64 {
-        // Approximate: peerMaxMsgSize - traffic overhead - session overhead
+        // Approximate: peerMaxMsgSize - traffic overhead - session overhead,
+        // capped at the IPv6 maximum payload size (65535).
         let tr_overhead = size_path(&[]) * 2 + 32 + 32 + size_uvarint(u64::MAX) + 1;
         let sess_overhead = 1 + 9 + 9 + 9 + 32 + BOX_OVERHEAD;
-        (PEER_MAX_MSG_SIZE - tr_overhead - sess_overhead) as u64
+        let raw = (PEER_MAX_MSG_SIZE - tr_overhead - sess_overhead) as u64;
+        raw.min(65535)
     }
 
     pub async fn set_path_notify<F>(&self, f: F)
@@ -2573,6 +2629,8 @@ impl PacketConn {
                     tx_bytes: p.tx_bytes,
                     uptime: p.connected_at.elapsed(),
                     latency: p.lag,
+                    jitter: p.jitter,
+                    loss_rate: p.loss_rate,
                 }).collect::<Vec<_>>()
             }).collect()
         } else { vec![] }
@@ -2681,10 +2739,11 @@ async fn peer_read_loop<R: AsyncRead + Unpin + Send + ?Sized>(
 
         let mut router = inner.router.lock().await;
 
-        // Update rx stats
+        // Update rx stats and liveness timestamp
         if let Some(ps) = router.peers.get_mut(&peer_key) {
             if let Some(p) = ps.get_mut(&peer_id) {
                 p.rx_bytes += frame.len() as u64;
+                p.last_rx_time = Instant::now();
             }
         }
 
