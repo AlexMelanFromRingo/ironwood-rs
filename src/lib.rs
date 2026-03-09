@@ -87,30 +87,36 @@
 //! ## Usage
 //!
 //! ```rust,no_run
-//! use ironwood_rs::PacketConn;
+//! use ironwood_rs::{PacketConn, BoxReader, BoxWriter};
 //! use ed25519_dalek::SigningKey;
 //! use rand::rngs::OsRng;
+//! use std::sync::Arc;
 //!
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {
 //!     // Generate or load an ed25519 identity key
 //!     let signing_key = SigningKey::generate(&mut OsRng);
 //!
-//!     // Create a PacketConn — the main API
-//!     let conn = PacketConn::new(signing_key).await?;
+//!     // Create a PacketConn — the main API (synchronous, no await)
+//!     let conn = Arc::new(PacketConn::new(signing_key));
 //!
-//!     // Connect to peers
+//!     // Connect a peer: exchange public keys out-of-band, then call handle_conn.
+//!     // See the `transport` module for a ready-made TCP helper.
 //!     let stream = tokio::net::TcpStream::connect("peer.example.com:9001").await?;
-//!     conn.handle_conn(stream).await?;
+//!     let peer_pub: [u8; 32] = todo!("obtain peer public key via handshake");
+//!     let (r, w) = tokio::io::split(stream);
+//!     let c = Arc::clone(&conn);
+//!     tokio::spawn(async move {
+//!         let _ = c.handle_conn(peer_pub, Box::new(r), Box::new(w), 0).await;
+//!     });
 //!
 //!     // Send encrypted traffic to a destination public key
 //!     let dest = [0u8; 32]; // target's ed25519 public key
 //!     conn.write_to(&[1, 2, 3, 4], &dest).await?;
 //!
 //!     // Receive decrypted traffic
-//!     let mut buf = vec![0u8; 65535];
-//!     let (n, from) = conn.read_from(&mut buf).await?;
-//!     println!("Received {} bytes from {:?}", n, &from[..8]);
+//!     let pkt = conn.read_from().await?;
+//!     println!("Received {} bytes from {:?}", pkt.payload.len(), &pkt.from[..8]);
 //!
 //!     Ok(())
 //! }

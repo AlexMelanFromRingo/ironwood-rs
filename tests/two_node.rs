@@ -11,7 +11,7 @@
 //! YGG_TEST_PEER=tcp://ygg.mkg20001.io:80 cargo test live_peer -- --nocapture
 //! ```
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
 use ironwood_rs::{transport, PacketConn};
@@ -56,10 +56,38 @@ async fn connected_pair() -> (PacketConn, PacketConn) {
         transport::handle_stream(&client_clone, stream, 0).await.unwrap_or(());
     });
 
-    // Let the Ironwood handshake (SigReq/SigRes + ANNOUNCE + BLOOM) complete
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    // Wait for the Ironwood handshake AND the first maintenance tick
+    // (SigReq/SigRes + ANNOUNCE + BLOOM_FILTER + bloom_do_maintenance).
+    // The maintenance tick fires every 1s, so we must wait >1s for
+    // bloom_fix_on_tree to set on_tree=true and path discovery to work.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
 
     (server, client)
+}
+
+/// Warm up path discovery: retry write_to until a packet is received.
+///
+/// PathLookup is only forwarded once bloom_do_maintenance has set on_tree=true,
+/// which requires at least one maintenance tick (1s interval). This helper
+/// retries every 500ms so subsequent ticks can complete the session handshake.
+async fn warmup(
+    sender: &PacketConn,
+    receiver: &PacketConn,
+    dst: &[u8; 32],
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let _ = sender.write_to(b"warmup", dst).await;
+        let recv_clone = receiver.clone();
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let probe = Duration::from_millis(800).min(remaining);
+        if tokio::time::timeout(probe, recv_clone.read_from()).await.is_ok() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -67,14 +95,24 @@ async fn connected_pair() -> (PacketConn, PacketConn) {
 // ---------------------------------------------------------------------------
 
 /// Two nodes connect and exchange encrypted traffic in both directions.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_two_nodes_exchange_traffic() {
     let (server, client) = connected_pair().await;
 
     let server_pub = server.public_key();
     let client_pub = client.public_key();
 
-    // Server reads one packet
+    // Warm up path discovery in both directions before the real assertions.
+    assert!(
+        warmup(&client, &server, &server_pub, Duration::from_secs(10)).await,
+        "client→server path never established"
+    );
+    assert!(
+        warmup(&server, &client, &client_pub, Duration::from_secs(10)).await,
+        "server→client path never established"
+    );
+
+    // client → server
     let server_clone = server.clone();
     let server_rx = tokio::spawn(async move {
         tokio::time::timeout(Duration::from_secs(5), server_clone.read_from())
@@ -82,17 +120,13 @@ async fn test_two_nodes_exchange_traffic() {
             .expect("server receive timed out")
             .expect("server read_from error")
     });
-
-    // Wait for path discovery to complete, then send
-    tokio::time::sleep(Duration::from_millis(500)).await;
     client.write_to(b"hello from client", &server_pub).await
         .expect("write_to failed");
-
     let pkt = server_rx.await.expect("server reader panicked");
     assert_eq!(&pkt.payload, b"hello from client", "payload mismatch");
     assert_eq!(pkt.from, client_pub, "source key mismatch");
 
-    // Reverse: server → client
+    // server → client
     let client_clone = client.clone();
     let client_rx = tokio::spawn(async move {
         tokio::time::timeout(Duration::from_secs(5), client_clone.read_from())
@@ -100,10 +134,8 @@ async fn test_two_nodes_exchange_traffic() {
             .expect("client receive timed out")
             .expect("client read_from error")
     });
-
     server.write_to(b"hello from server", &client_pub).await
         .expect("write_to server→client failed");
-
     let pkt2 = client_rx.await.expect("client reader panicked");
     assert_eq!(&pkt2.payload, b"hello from server");
     assert_eq!(pkt2.from, server_pub);

@@ -2498,10 +2498,12 @@ impl PacketConn {
     pub fn public_key(&self) -> PublicKeyBytes { self.inner.pub_key }
 
     pub fn mtu(&self) -> u64 {
-        // Approximate: peerMaxMsgSize - traffic overhead - session overhead
+        // Approximate: peerMaxMsgSize - traffic overhead - session overhead,
+        // capped at the IPv6 maximum payload size (65535).
         let tr_overhead = size_path(&[]) * 2 + 32 + 32 + size_uvarint(u64::MAX) + 1;
         let sess_overhead = 1 + 9 + 9 + 9 + 32 + BOX_OVERHEAD;
-        (PEER_MAX_MSG_SIZE - tr_overhead - sess_overhead) as u64
+        let raw = (PEER_MAX_MSG_SIZE - tr_overhead - sess_overhead) as u64;
+        raw.min(65535)
     }
 
     pub async fn set_path_notify<F>(&self, f: F)
